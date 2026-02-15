@@ -1,0 +1,336 @@
+\documentclass{ctexart}
+
+\usepackage[top=1.5cm, bottom=1.5cm, left=2.0cm, right=2.0cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{graphicx}
+
+\pagestyle{plain}
+\ctexset{tablename = {Table}}
+
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}} 
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    numbers=left,
+    numberstyle=\tiny,
+    frame=single,
+    breaklines=true,
+    captionpos=b,
+    keywordstyle=\color{blue},
+    commentstyle=\color{green},
+    stringstyle=\color{red},
+    showstringspaces=false
+}
+
+\newcounter{cnt}
+\theoremstyle{definition} \newtheorem{problem}[cnt]{Problem}
+\AtBeginEnvironment{problem}{\setlength{\parindent}{0pt}}
+\newtheorem*{sol}{Solution}
+
+\newlist{questions}{enumerate}{1}
+\setlist[questions]{label=(\alph*), leftmargin=2.2em, itemsep=0.6em}
+\newlist{subquestions}{enumerate}{1}
+\setlist[subquestions]{label=(\alph*), leftmargin=2.2em, itemsep=0.4em}
+
+\newenvironment{solution}{\begin{sol}\end{sol}\setlength{\parindent}{0pt}\begin{questions}}{
+    \end{questions}\vspace{2.5em}}
+\newenvironment{solution*}{\begin{sol}\end{sol}}{\vspace{2.5em}}
+
+\title{CS336 Assignment 2: Systems and Parallelism}
+\author{袁奕}
+
+\begin{document}
+
+\maketitle
+
+\section{Optimizing Attention with FlashAttention-2}
+
+\begin{problem}[\code{benchmarking_script}]
+End-to-End Benchmarking (4 points)
+\begin{questions}
+    \item Write a script to perform basic end-to-end benchmarking of the forward and backward passes in your model. Your script should support initializing a model from hyperparameters, generating random batches, and timing $n$ steps after $w$ warm-up steps. Use \code{torch.cuda.synchronize()} after each step.
+    \item Time the forward and backward passes for the model sizes described in Table 1 (Small, Medium, Large, XL, 2.7B). Use 5 warmup steps and 10 measurement steps. Report the average and standard deviation.
+    \item Repeat the analysis without warm-up steps, and with only 1 or 2 warm-up steps. Why do the results differ?
+\end{questions}
+\end{problem}
+\begin{solution}
+    \item \url{https://github.com/yuanyi-350/llm-from-scratch-assignment2-systems/blob/master/cs336_systems/benchmark.py}
+    
+    \item 
+    
+    \begin{lstlisting}
+stu2400010766@lfs-dev:~/cs336-2$ uv run python -m cs336_systems.benchmark \ 
+    --model_size small --context_length 128 --mode forward --n_steps 5 --profile_memory
+Running on cuda
+Monkey patching scaled_dot_product_attention with NVTX annotated version...
+Using Full Precision (FP32)
+Warming up for 5 steps...
+Measuring for 5 steps...
+Starting memory recording...
+Peak Memory Usage: 546.23 MB
+Memory snapshot saved to memory_snapshot_small_128_forward.pickle
+Model: small, Context: 128, Mode: forward, BF16: False
+Average Time: 0.0158 s
+Std Dev: 0.0005 s
+
+stu2400010766@lfs-dev:~/cs336-2$ uv run python -m cs336_systems.benchmark \ 
+    --model_size medium --context_length 128 --mode forward --n_steps 5 --profile_memory
+Running on cuda
+Monkey patching scaled_dot_product_attention with NVTX annotated version...
+Using Full Precision (FP32)
+Warming up for 5 steps...
+Measuring for 5 steps...
+Starting memory recording...
+Peak Memory Usage: 1676.35 MB
+Memory snapshot saved to memory_snapshot_medium_128_forward.pickle
+Model: medium, Context: 128, Mode: forward, BF16: False
+Average Time: 0.0313 s
+Std Dev: 0.0007 s
+
+stu2400010766@lfs-dev:~/cs336-2$ uv run python -m cs336_systems.benchmark \ 
+    --model_size large --context_length 128 --mode forward --n_steps 5 --profile_memory
+Running on cuda
+Monkey patching scaled_dot_product_attention with NVTX annotated version...
+Using Full Precision (FP32)
+Warming up for 5 steps...
+Measuring for 5 steps...
+Starting memory recording...
+Peak Memory Usage: 3874.17 MB
+Memory snapshot saved to memory_snapshot_large_128_forward.pickle
+Model: large, Context: 128, Mode: forward, BF16: False
+Average Time: 0.0468 s
+Std Dev: 0.0009 s
+
+stu2400010766@lfs-dev:~/cs336-2$ uv run python -m cs336_systems.benchmark \ 
+    --model_size xl --context_length 128 --mode forward --n_steps 5 --profile_memory
+Running on cuda
+Monkey patching scaled_dot_product_attention with NVTX annotated version...
+Using Full Precision (FP32)
+Warming up for 5 steps...
+Measuring for 5 steps...
+Starting memory recording...
+Peak Memory Usage: 7882.78 MB
+Memory snapshot saved to memory_snapshot_xl_128_forward.pickle
+Model: xl, Context: 128, Mode: forward, BF16: False
+Average Time: 0.0616 s
+Std Dev: 0.0007 s
+
+stu2400010766@lfs-dev:~/cs336-2$ uv run python -m cs336_systems.benchmark \ 
+    --model_size 2.7B --context_length 128 --mode forward --n_steps 5 --profile_memory
+Running on cuda
+Monkey patching scaled_dot_product_attention with NVTX annotated version...
+Using Full Precision (FP32)
+Warming up for 5 steps...
+Measuring for 5 steps...
+Starting memory recording...
+Peak Memory Usage: 13232.80 MB
+Memory snapshot saved to memory_snapshot_2.7B_128_forward.pickle
+Model: 2.7B, Context: 128, Mode: forward, BF16: False
+Average Time: 0.0799 s
+Std Dev: 0.0004 s
+    \end{lstlisting}
+
+\end{solution}
+
+
+\begin{problem}[\code{nsys_profile}]
+Nsight Systems Profiler (5 points)
+\begin{questions}
+    \item Profile your forward pass using \code{nsys}. Does the total time spent match your measurements from the Python standard library?
+    \item Which CUDA kernel takes the most cumulative GPU time during the forward pass? How many times is it invoked? Is it the same for the backward pass?
+    \item Besides matrix multiplications, what other kernels account for non-trivial runtime in the forward pass?
+    \item Profile a complete training step with AdamW. How does the fraction of time spent on matrix multiplication change compared to inference?
+    \item Compare the runtime vs. FLOPs difference for the softmax operation and matrix multiplications within the self-attention layer.
+\end{questions}
+\end{problem}
+
+\begin{problem}[\code{mixed_precision_accumulation}]
+    Mixed Precision Accumulation (1 point)
+
+    Run the provided code involving FP32 and FP16 summations. Comment on the accuracy of the results for each case.
+
+    \begin{lstlisting}[language=Python]
+import torch
+
+s = torch.tensor(0,dtype=torch.float32)
+for i in range(1000):
+    s += torch.tensor(0.01,dtype=torch.float32)
+print(s)
+
+s = torch.tensor(0,dtype=torch.float16)
+for i in range(1000):
+    s += torch.tensor(0.01,dtype=torch.float16)
+print(s)
+
+s = torch.tensor(0,dtype=torch.float32)
+for i in range(1000):
+    s += torch.tensor(0.01,dtype=torch.float16)
+print(s)
+
+s = torch.tensor(0,dtype=torch.float32)
+for i in range(1000):
+    x = torch.tensor(0.01,dtype=torch.float16)
+    s += x.type(torch.float32)
+print(s)        
+    \end{lstlisting}
+
+    output:
+    \begin{lstlisting}
+tensor(10.0001)
+tensor(9.9531, dtype=torch.float16)
+tensor(10.0021)
+tensor(10.0021)
+    \end{lstlisting}
+\end{problem}
+
+\begin{problem}[\code{benchmarking_mixed_precision}]
+Mixed Precision Benchmarking (2 points)
+\begin{questions}
+    \item For the provided \code{ToyModel}, what are the data types of the parameters, FC1 output, LayerNorm output, logits, loss, and gradients when using FP16 autocasting?
+    \item Which parts of Layer Normalization are sensitive to mixed precision? If using BF16 instead of FP16, do we still need to treat it differently?
+    \item Modify your benchmarking script to support BF16 mixed precision. Compare results with full precision across different model sizes.
+\end{questions}
+\end{problem}
+
+\begin{problem}[\code{memory_profiling}]
+Memory Profiling (4 points)
+\begin{questions}
+    \item Profile the 2.7B model's forward pass and a full training step using \code{memory_viz}. Can you identify the stages based on the peaks?
+    \item Report peak memory usage for context lengths 128, 256, and 512 for both forward pass and full training steps.
+    \item Does mixed precision significantly affect peak memory usage?
+    \item Calculate the size (in MB) of a single-precision activation tensor in the 2.7B model residual stream.
+    \item Identify the largest allocations in the "Active Memory Timeline" and their origins in the code.
+\end{questions}
+\end{problem}
+
+\begin{problem}[\code{pytorch_attention}]
+Benchmarking PyTorch Attention (2 points)
+\begin{questions}
+    \item Benchmark your attention implementation across $d_{model} \in [16, 32, 64, 128]$ and $seq\_len \in [256, 1024, 4096, 8192, 16384]$. At what size do you encounter OOM errors? How does memory saved for backward scale with sequence length?
+\end{questions}
+\end{problem}
+
+\begin{problem}[\code{torch_compile}]
+JIT-Compiled Attention (2 points)
+\begin{questions}
+    \item Compare the performance of a \code{torch.compile} version of your attention vs. the uncompiled version.
+    \item Compile your entire Transformer model. How does the performance of the forward pass and full training step change?
+\end{questions}
+\end{problem}
+
+\section{Flash Attention Implementation}
+
+\begin{problem}[\code{flash_forward}]
+FlashAttention-2 Forward Pass (15 points)
+\begin{questions}
+    \item Implement a pure PyTorch (tiled) version of FlashAttention-2 forward pass to help with debugging.
+    \item Write a Triton kernel for the FlashAttention-2 forward pass (Algorithm 1). Wrap it in a \code{torch.autograd.Function}.
+    \item Add support for causal masking in the Triton kernel. Masked elements should have $-1\times 10^6$ added to the scores.
+\end{questions}
+\end{problem}
+
+\begin{problem}[\code{flash_backward}]
+FlashAttention-2 Backward Pass (5 points)
+\begin{questions}
+    \item Implement the backward pass for FlashAttention-2 using \code{torch.compile} and the recomputation strategy (Equations 13-19).
+\end{questions}
+\end{problem}
+
+\section{Distributed Data Parallel Training}
+
+\begin{problem}[\code{distributed_communication_single_node}]
+Distributed Communication (5 points)
+\begin{questions}
+    \item Benchmark the \code{all-reduce} operation. Vary the backend (Gloo/NCCL), data size (1MB to 1GB), and number of processes (2, 4, 6).
+\end{questions}
+\end{problem}
+
+\begin{problem}[\code{naive_ddp}]
+Naïve DDP (5 points)
+\begin{questions}
+    \item Implement a script to perform DDP training by all-reducing individual parameter gradients. Verify correctness against single-process training.
+\end{questions}
+\end{problem}
+
+\begin{problem}[\code{ddp_overlap_bucketed}]
+Overlapping and Bucketing (8 points)
+\begin{questions}
+    \item Implement a DDP class that supports gradient bucketing (with a \code{bucket_size_mb} parameter) and overlaps communication with the backward pass using hooks.
+\end{questions}
+\end{problem}
+
+\section{Optimizer State Sharding}
+
+\begin{problem}[\code{optimizer_state_sharding}]
+Optimizer State Sharding (15 points)
+\begin{questions}
+    \item Implement a sharded optimizer class that partitions optimizer states across ranks. Each rank should only update its own subset of parameters and then broadcast the updates.
+\end{questions}
+\end{problem}
+
+\begin{problem}[\code{optimizer_state_sharding_accounting}]
+Sharding Analysis (5 points)
+\begin{questions}
+    \item Profile peak memory usage with and without sharding. Report usage at initialization, before the optimizer step, and after.
+    \item How does sharding affect training speed?
+    \item Contrast your implementation with ZeRO Stage 1 in terms of memory and communication volume.
+\end{questions}
+\end{problem}
+
+\begin{lstlisting}
+stu2400010766@lfs-dev:~/cs336-2$ uv run python -m cs336_systems.benchmark --model_size xl --context_length 128 --mode forward --n_steps 
+100
+Running on cuda
+Monkey patching scaled_dot_product_attention with NVTX annotated version...
+Compiling model...
+Using Full Precision (FP32)
+Warming up for 5 steps...
+/home/stu2400010766/cs336-2/.venv/lib/python3.13/site-packages/torch/_dynamo/variables/functions.py:1692: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS="+dynamo" for a DEBUG stack trace.
+  torch._dynamo.utils.warn_once(msg)
+W0213 22:19:50.750000 1056616 .venv/lib/python3.13/site-packages/torch/fx/experimental/symbolic_shapes.py:6833] [8/1] _maybe_guard_rel() was called on non-relation expression Eq(s16, 1) | Eq(s16, 128)
+Measuring for 100 steps...
+Model: xl, Context: 128, Mode: forward, BF16: False
+Average Time: 0.0507 s
+Std Dev: 0.0001 s
+
+stu2400010766@lfs-dev:~/cs336-2$ uv run python -m cs336_systems.benchmark --model_size xl --context_length 128 --mode forward --n_steps 100
+Running on cuda
+Monkey patching scaled_dot_product_attention with NVTX annotated version...
+Using Full Precision (FP32)
+Warming up for 5 steps...
+Measuring for 100 steps...
+Model: xl, Context: 128, Mode: forward, BF16: False
+Average Time: 0.0587 s
+Std Dev: 0.0075 s
+
+stu2400010766@lfs-dev:~/cs336-2$ uv run python -m cs336_systems.benchmark --model_size xl --context_length 128 --mode forward --n_steps 100 --mixed_precision
+Running on cuda
+Monkey patching scaled_dot_product_attention with NVTX annotated version...
+Using Mixed Precision (BFloat16)
+Warming up for 5 steps...
+Measuring for 100 steps...
+Model: xl, Context: 128, Mode: forward, BF16: True
+Average Time: 0.0537 s
+Std Dev: 0.0126 s
+
+stu2400010766@lfs-dev:~/cs336-2$ uv run python -m cs336_systems.benchmark --model_size xl --context_length 128 --mode forward --n_steps 100 --mixed_precision --compile
+Running on cuda
+Monkey patching scaled_dot_product_attention with NVTX annotated version...
+Compiling model...
+Using Mixed Precision (BFloat16)
+Warming up for 5 steps...
+/home/stu2400010766/cs336-2/.venv/lib/python3.13/site-packages/torch/_dynamo/variables/functions.py:1692: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS="+dynamo" for a DEBUG stack trace.
+  torch._dynamo.utils.warn_once(msg)
+W0213 22:23:47.686000 1062952 .venv/lib/python3.13/site-packages/torch/fx/experimental/symbolic_shapes.py:6833] [8/1] _maybe_guard_rel() was called on non-relation expression Eq(s16, 1) | Eq(s16, 128)
+Measuring for 100 steps...
+Model: xl, Context: 128, Mode: forward, BF16: True
+Average Time: 0.0264 s
+Std Dev: 0.0005 s
+\end{lstlisting}
+
+\end{document}
