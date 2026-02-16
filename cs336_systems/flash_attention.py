@@ -38,13 +38,17 @@ class FlashAttn2Pytorch(torch.autograd.Function):
 
                 for kj in range(0, Nk, Bk):
                     k = K[b, kj:kj+Bk, :].to(torch.float32)  # shape: (Bk, D)
-                    v = V[b, kj:kj+Bk, :]                    # shape: (Bk, D), dtype: V.dtype
+                    v = V[b, kj:kj+Bk, :]                    # shape: (Bk, D), dtype: V.dtypedtype
 
                     # S[q, k] = sum_d q[q, d] * k[k, d]
                     s = einsum(q, k, 'q d, k d -> q k') * scale  # (Bq, Bk) fp32
 
                     m_new = torch.maximum(m, s.max(dim=1).values)   # (Bq,)
                     p = torch.exp(s - m_new[:, None])               # (Bq, Bk) fp32
+
+                    # 前 kj - 1 个 tile 的 loss 累加为 m * l
+                    # 第 kj 个 tile 的 loss 为 m_new * p.sum(dim=1)
+                    # 统一写成 exp(m_new) * l_new
                     l_new = torch.exp(m - m_new) * l + p.sum(dim=1) # (Bq,)
 
                     # (P @ V)[q, d] = sum_k p[q, k] * v[k, d]
@@ -80,7 +84,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
-    is_causal: tl.constexpr,   # for (c); you can set False in (b)
+    is_causal: tl.constexpr,
 ):
     query_tile_index = tl.program_id(0)
     batch_index = tl.program_id(1)

@@ -1,0 +1,229 @@
+\documentclass{ctexart}
+
+\usepackage[top=1.5cm, bottom=1.5cm, left=2.0cm, right=2.0cm]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{amsmath, amssymb}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{float}
+
+\algrenewcommand\algorithmicrequire{\textbf{Require:}}
+\algrenewcommand\algorithmicensure{\textbf{Ensure:}}
+
+\newcommand{\vQ}{\mathbf{Q}}
+\newcommand{\vK}{\mathbf{K}}
+\newcommand{\vV}{\mathbf{V}}
+\newcommand{\vO}{\mathbf{O}}
+\newcommand{\vS}{\mathbf{S}}
+\newcommand{\vP}{\mathbf{P}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\R}{\ensuremath{\mathbb{R}}}
+
+\pagestyle{plain}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    numbers=left,
+    numberstyle=\tiny,
+    frame=single,
+    breaklines=true,
+    captionpos=b,
+    keywordstyle=\color{blue},
+    commentstyle=\color{green},
+    stringstyle=\color{red},
+    showstringspaces=false
+}
+
+\title{LLM structures}
+
+\begin{document}
+
+\maketitle
+
+\section{Attention}
+
+设输入是一串 token id: $x_{1: T} \in\{1, \cdots, V\}$, 其中 $V$ 是词表大小, $T$ 是序列长度.
+
+\begin{enumerate}
+    \item Token Embedding(词嵌入)
+    用嵌入矩阵 $E \in \R^{V \times d}$ 把离散 token 映射成连续向量:
+
+    即如果这个token的编号为 $k \in \{ 1, 2, \cdots, V \}$, 那么对应的向量为 $E$ 的第 $k$ 行. 这一步就是"查表".
+
+    \item 堆叠 N 层 TransFormer Blocks 重复 $N$ 次:
+    $h^{(\ell)}=\operatorname{Block}_{\ell}\left(h^{(\ell-1)}\right), \quad \ell=1 \cdots N$
+
+    RMSNorm 不改变shape, 其数学定义: 对 $x_t \in \R^d$ :
+
+    $$
+    \begin{aligned}
+    \mathrm{rms}_t = \sqrt{\frac1d \sum_{i=1}^d x_{t, i}^2+\epsilon} \\
+    \operatorname{RMSNorm}(x_t)_i = \dfrac{x_{t, i}}{\mathrm{rms}_t}
+    \end{aligned}
+    $$
+
+    每个Block的结构
+
+    \begin{lstlisting}[language=Python]
+class TransFormerBlock(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, 
+                 norm_type: str = 'pre'):
+        super().__init__()
+        self.norm_type = norm_type
+        self.norm1 = RMSNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
+        self.mha = CausalMultiHeadSelfAttention(d_model, num_heads)
+        self.ffn = SwiGLU(d_model, d_ff)
+
+    def Forward(self, x: torch.Tensor, rope_module=None, token_positions=None):
+        if self.norm_type == 'pre': # Pre-norm (Standard): x + Sublayer(Norm(x))
+            x_norm = self.norm1(x)
+            attn_out = self.mha(x_norm, rope_module=rope_module, token_positions=token_positions)
+
+            x_norm2 = self.norm2(x + attn_out)
+            x = x + self.ffn(x_norm2)
+
+        elif self.norm_type == 'post': # Post-norm: Norm(x + Sublayer(x))
+            attn_out = self.mha(x, rope_module=rope_module, token_positions=token_positions)
+            x = self.norm1(x + attn_out)
+
+            ffn_out = self.ffn(x)
+            x = self.norm2(x + ffn_out)
+        return x
+    \end{lstlisting}
+
+    \begin{itemize}
+    \item Attention
+
+    $$
+    \operatorname{Attention}(Q, K, V)=\operatorname{softmax}\left(\frac{Q K^T}{\sqrt{d_k}}\right) V
+    $$
+
+    where $Q \in \R^{n \times d_k}, K \in \R^{m \times d_k}$, and $V \in \R^{m \times d_v}$ where $Q = W_QX, K=W_KX, V = W_VX$.
+
+    \item MultiHeadAttention (MHA)
+
+    $$
+    \begin{aligned}
+    \operatorname{MultiHead}(Q, K, V) & =\operatorname{Concat}\left(\operatorname{head}_1, \cdots, \operatorname{head}_h\right) \\
+      \text { For } \operatorname{head}_i & =\operatorname{Attention}\left(Q_i, K_i, V_i\right)
+    \end{aligned}
+    $$
+      
+    with $Q_i, K_i, V_i$ being slice number $i \in\{1, \cdots, h\}$ of size $d_k$ or $d_v$ of the embedding dimension For $Q, K$, and $V$ respectively.
+
+    $$
+    \text { MultiHeadSelfAttention }(x)=W_O \text { MultiHead }\left(W_Q x, W_K x, W_V x\right)
+    $$
+
+    Here, the learnable parameters are $W_Q \in \R^{h d_k \times d_{\text {model }}}, W_K \in \R^{h d_k \times d_{\text {model }}}, W_V \in \R^{h d_v \times d_{\text {model }}}$, and $W_O \in \R^{d_{\text {model }} \times h d_v}$. Since the $Q \mathrm{~s}, K$, and $V \mathrm{~s}$ are sliced in the multi-head attention operation, we can think of $W_Q$, $W_K$ and $W_V$ as being separated For each head along the output dimension.
+    \end{itemize}
+
+    \item Norm(最终层归一化)
+    很多 LLM 用 Pre-LN 架构, 最后还有一个 LayerNorm／RMSNorm:
+    $$
+    \tilde{h}_t=\operatorname{Norm}\left(h_t^{(L)}\right)
+    $$
+
+    \item Linear(LM Head／输出投影)
+    把隐藏向量投影到词表维度得到 logits:
+    $$
+    z_t=W_o \tilde{h}_t+b, \quad W_o \in \R^{V \times d}
+    $$
+
+    (很多模型会 weight tying : $W_o=E$ 或 $W_o=E^{\top}$ 的变体. )
+
+    \item Softmax(输出概率)
+
+    $$
+    p\left(x_{t+1}=v | x_{\le t}\right)=\operatorname{softmax}\left(z_t\right)_v = \frac{e^{z_{t, v}}}{\sum_{u=1}^V e^{z_{t, u}}}
+    $$
+
+    训练时用交叉熵:
+
+    $$
+    \mathcal{L}=-\sum_{t=1}^{T-1} \log p\left(x_{t+1} | x_{\le t}\right)
+    $$
+
+\end{enumerate}
+
+\section{Flash Attention}
+
+对任意一个 query 行 $q_r$ (第 $r$ 个 token/位置), 标准 attention 定义是:
+
+\begin{itemize}
+    \item 分数(logits): $s_{rj}=\dfrac{q_r^\top k_j}{\sqrt d}$
+
+    \item softmax 权重: $p_{rj}=\dfrac{e^{s_{rj}}}{\sum\limits_{t=1}^{N_k} e^{s_{rt}}}$
+
+    \item 输出向量(attention output): $o_r=\sum\limits_{j=1}^{N_k} p_{rj}, v_j$, 累积得
+
+    $$
+    \begin{aligned}
+    O &= \mathrm{softmax} \left(\frac{QK^\top}{\sqrt d}\right)V \in \R^{N_q\times d} \\
+    L_r &= \log\sum_{j=1}^{N_k} e^{s_{rj}}, \qquad L\in\R^{N_q}
+    \end{aligned}
+    $$
+
+\end{itemize}
+
+
+\begin{algorithm}[H]
+\caption{FlashAttention-2 forward pass}
+\label{alg:flashattn2}
+\begin{algorithmic}[1] % [1] 表示显示行号
+\Require $Q \in \mathbb{R}^{N_q \times d}$, $K, V \in \mathbb{R}^{N_k \times d}$, tile sizes $B_q, B_k$
+\State Split $Q$ into $T_q=\left\lceil \frac{N_q}{B_q}\right\rceil$ tiles $Q_1,\ldots,Q_{T_q}$ of size $B_q\times d$
+\State Split $K,V$ into $T_k=\left\lceil \frac{N_k}{B_k}\right\rceil$ tiles $K^{(1)},\ldots,K^{(T_k)}$ and $V^{(1)},\ldots,V^{(T_k)}$ of size $B_k\times d$
+\For{$i = 1,\ldots,T_q$}
+  \State Load $Q_i$ from global memory
+  \State Initialize $O_i^{(0)} = 0 \in \mathbb{R}^{B_q \times d}$, $l_i^{(0)}=0 \in \mathbb{R}^{B_q}$, $m_i^{(0)}=-\infty \in \mathbb{R}^{B_q}$
+  \For{$j = 1,\ldots,T_k$}
+    \State Load $K^{(j)}, V^{(j)}$ from global memory
+    \State Compute tile of pre-softmax attention scores
+      $S_i^{(j)} = \dfrac{Q_i (K^{(j)})^\top}{\sqrt{d}} \in \mathbb{R}^{B_q \times B_k}$
+    \State Compute $m_i^{(j)} = \max\!\Big(m_i^{(j-1)}, \mathrm{rowmax}(S_i^{(j)})\Big)\in\mathbb{R}^{B_q}$
+    \State Compute $\tilde{P}_i^{(j)}=\exp\!\Big(S_i^{(j)}-m_i^{(j)}\Big)\in\mathbb{R}^{B_q\times B_k}$
+    \State Compute $\color{red}{l_i^{(j)}=\exp\!\Big(m_i^{(j-1)}-m_i^{(j)}\Big) l_i^{(j-1)}+\mathrm{rowsum}(\tilde{P}_i^{(j)})\in\mathbb{R}^{B_q}}$
+    \State Compute $O_i^{(j)}=\mathrm{diag}\!\Big(\exp(m_i^{(j-1)}-m_i^{(j)})\Big)O_i^{(j-1)}+\tilde{P}_i^{(j)}V^{(j)}$
+  \EndFor
+  \State Compute $O_i=\mathrm{diag}\!\Big((l_i^{(T_k)})^{-1}\Big)O_i^{(T_k)}$
+  \State Compute $L_i=m_i^{(T_k)}+\log(l_i^{(T_k)})$
+  \State Write $O_i$ to global memory as the $i$-th tile of $O$
+  \State Write $L_i$ to global memory as the $i$-th tile of $L$
+\EndFor
+\State \textbf{return} the output $O$ and the logsumexp $L$
+\end{algorithmic}
+\end{algorithm}
+
+
+FlashAttention-2 的目标是: 不显式存完整的 $S$ 或 $P$ (它们是 $N_q\times N_k$, 太大), 而是分块扫描 key/value, 并且仍然得到“等价于全量 softmax”的 $O$ 和 $L$.
+
+因此对于每个 query tile (i)(包含 $B_q$ 行), 它维护三样东西(按行):
+
+\begin{itemize}
+    \item $m$: 当前看过的 logits 的行最大值
+    \item $l$: 在以 $m$ 为基准时的 softmax 分母累积
+    \item $O$: 在以 $m$ 为基准时的“未除分母”的输出累积
+\end{itemize}
+
+值得一提的, 为了数值稳定性, 我们每轮存储的 Loss 其实是 $\exp(m) \cdot l$.
+
+前 $j - 1$ 轮的 Loss 为 $\exp(m_i^{(j - 1)}) \cdot l_i^{(j - 1)}$, 第 $j$ 轮的 Loss 为 $\exp(m_i^{(j)}) \cdot \mathrm{rowsum}(\tilde{P}_i^{(j)})$, 因此
+
+$$
+\begin{aligned}
+\text{ 前 $j$ 轮的 Loss } &= \exp(m_i^{(j - 1)}) \cdot l_i^{(j - 1)} + \exp(m_i^{(j)}) \cdot \mathrm{rowsum}(\tilde{P}_i^{(j)}) \\
+&= \exp(m_i^{(j)}) \cdot \left[ \exp(m_i^{(j - 1)} - m_i^{(j)}) \cdot l_i^{(j - 1)} + \mathrm{rowsum}(\tilde{P}_i^{(j)}) \right]
+\end{aligned}
+$$
+
+这就推导出 11 行红色的公式
+
+\end{document}
