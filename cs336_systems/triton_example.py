@@ -1,7 +1,7 @@
 import triton
 import triton.language as tl
 import torch
-from einops import rearrange, einsum
+from einops import rearrange
 
 @triton.jit
 def weighted_sum_fwd(
@@ -96,14 +96,6 @@ def weighted_sum_backward(
     n_row_tiles = tl.num_programs(0)
 
     # Inputs
-    grad_output_block_ptr = tl.make_block_ptr(
-        grad_output_ptr,
-        shape=(NUM_ROWS,), strides=(stride_gr,),
-        offsets=(row_tile_idx * ROWS_TILE_SIZE,),
-        block_shape=(ROWS_TILE_SIZE,),
-        order=(0,),
-    )
-
     x_block_ptr = tl.make_block_ptr(
         x_ptr,
         shape=(NUM_ROWS, D,), strides=(stride_xr, stride_xd),
@@ -118,7 +110,17 @@ def weighted_sum_backward(
         offsets=(0,), block_shape=(D_TILE_SIZE,),
         order=(0,),
     )
-
+    
+    # Grad input
+    grad_output_block_ptr = tl.make_block_ptr(
+        grad_output_ptr,
+        shape=(NUM_ROWS,), strides=(stride_gr,),
+        offsets=(row_tile_idx * ROWS_TILE_SIZE,),
+        block_shape=(ROWS_TILE_SIZE,),
+        order=(0,),
+    )
+    
+    # Grad outputs
     grad_x_block_ptr = tl.make_block_ptr(
         grad_x_ptr,
         shape=(NUM_ROWS, D,), strides=(stride_gxr, stride_gxd),
@@ -137,6 +139,7 @@ def weighted_sum_backward(
     
     for i in range(tl.cdiv(D, D_TILE_SIZE)):
         grad_output = tl.load(grad_output_block_ptr, boundary_check=(0,), padding_option="zero")
+        
         # (ROWS_TILE_SIZE,)
         # Outer product for grad_x
         weight = tl.load(weight_block_ptr, boundary_check=(0,), padding_option="zero")
@@ -144,7 +147,7 @@ def weighted_sum_backward(
         tl.store(grad_x_block_ptr, grad_x_row, boundary_check=(0, 1))
         
         # Reduce as many rows as possible for the grad_weight result
-        # (D_TILE_SIZE,)66
+        # (D_TILE_SIZE,)
         row = tl.load(x_block_ptr, boundary_check=(0, 1), padding_option="zero") # (ROWS_TILE_SIZE, D_TILE_SIZE)
         grad_weight_row = tl.sum(row * grad_output[:, None], axis=0, keep_dims=True)
         tl.store(partial_grad_weight_block_ptr, grad_weight_row, boundary_check=(1,)) # Never out of bounds for dim 0
@@ -184,6 +187,14 @@ class WeightedSumFunc(torch.autograd.Function):
         
         # Launch our kernel with n instances in our 1D grid.
         n_rows = y.numel()
+        
+        # Example: x.shape: (100, 4096)
+        #   n_rows = 100, grid=(tl.cdiv(n_rows, ctx.ROWS_TILE_SIZE),)=(7,) means we launch 7 
+        # independent programs (kernel instances).
+        #   These 7 programs run in parallel on the GPU, where each program uses its `program_id` to 
+        # identify and process its specific tile of rows. Program 0 handles rows 0-15, ..., 
+        # Program 6 handles rows 96-99. All programs calculate  and write to memory simultaneously 
+        # without synchronization.
         weighted_sum_fwd[(tl.cdiv(n_rows, ctx.ROWS_TILE_SIZE),)](
             x, weight,
             y,
@@ -196,3 +207,29 @@ class WeightedSumFunc(torch.autograd.Function):
 
         return y.view(input_shape[:-1])
     
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, weight = ctx.saved_tensors
+        ROWS_TILE_SIZE, D_TILE_SIZE = ctx.ROWS_TILE_SIZE, ctx.D_TILE_SIZE
+        n_rows, D = x.shape
+
+        # These don't have to be the same
+        # Our strategy is for each thread block to first write to a partial buffer,
+        # then we reduce over this buffer to get the final gradient.
+        partial_grad_weight = torch.empty((tl.cdiv(n_rows, ROWS_TILE_SIZE), D), device=x.device, dtype=x.dtype)
+        grad_x = torch.empty_like(x)
+
+        weighted_sum_backward[(cdiv(n_rows, ROWS_TILE_SIZE),)](
+            x, weight,
+            grad_out,
+            grad_x, partial_grad_weight,
+            x.stride(0), x.stride(1),
+            weight.stride(0),
+            grad_out.stride(0),
+            grad_x.stride(0), grad_x.stride(1),
+            partial_grad_weight.stride(0), partial_grad_weight.stride(1),
+            NUM_ROWS=n_rows, D=D,
+            ROWS_TILE_SIZE=ROWS_TILE_SIZE, D_TILE_SIZE=D_TILE_SIZE,
+        )
+        grad_weight = partial_grad_weight.sum(axis=0)
+        return grad_x, grad_weight

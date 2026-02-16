@@ -2,7 +2,7 @@ import torch
 import timeit
 import argparse
 import numpy as np
-from einops import rearrange, einsum
+from einops import einsum
 from cs336_basics.model import BasicsTransformerLM
 import cs336_basics.model
 import torch.cuda.nvtx as nvtx
