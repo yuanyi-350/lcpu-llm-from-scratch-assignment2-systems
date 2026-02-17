@@ -1,0 +1,13 @@
+{"ts": "20260217_232008", "label": "FlashAttn2Triton fwd+bwd", "ms_per_iter": 192.0307, "rep": 10, "warmup": 5}
+{"ts": "20260217_232010", "label": "FlashAttn2Triton+compile", "ms_per_iter": 193.2554, "rep": 10, "warmup": 5}
+{"ts": "20260217_232042", "label": "FlashAttn2Triton fwd+bwd", "ms_per_iter": 192.1966, "rep": 10, "warmup": 5}
+{"ts": "20260217_232044", "label": "FlashAttn2Triton+compile", "ms_per_iter": 193.2964, "rep": 10, "warmup": 5}
+{"ts": "20260217_232211", "label": "FlashAttn2Triton fwd+bwd", "ms_per_iter": 191.9898, "rep": 10, "warmup": 5}
+{"ts": "20260217_232213", "label": "FlashAttn2Triton+compile", "ms_per_iter": 193.0557, "rep": 10, "warmup": 5}
+{"ts": "20260217_232408", "label": "FlashAttn2Triton fwd+bwd", "ms_per_iter": 192.0205, "rep": 10, "warmup": 5}
+{"ts": "20260217_232410", "label": "FlashAttn2Triton+compile", "ms_per_iter": 193.0916, "rep": 10, "warmup": 5}
+{"ts": "20260217_232819", "label": "FlashAttn2Triton fwd+bwd", "ms_per_iter": 191.9918, "rep": 10, "warmup": 5}
+{"ts": "20260217_232821", "label": "FlashAttn2Triton+compile", "ms_per_iter": 193.0506, "rep": 10, "warmup": 5}
+{"ts": "20260217_232847", "label": "FlashAttn2Triton fwd+bwd", "ms_per_iter": 192.043, "rep": 10, "warmup": 5}
+{"ts": "20260217_232849", "label": "FlashAttn2Triton+compile", "ms_per_iter": 193.1284, "rep": 10, "warmup": 5}
+{"ts": "20260217_232849", "label": "Naive (scores) fwd+bwd", "ms_per_iter": 4.4666, "rep": 10, "warmup": 5}

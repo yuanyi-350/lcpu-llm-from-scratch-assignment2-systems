@@ -1,3 +1,6 @@
+import os
+import json
+import datetime
 import torch
 import timeit
 import argparse
@@ -36,6 +39,8 @@ def annotated_scaled_dot_product_attention(Q, K, V, mask=None):
     
     return attention_output
 
+
+
 def benchmark(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Running on {device}")
@@ -70,6 +75,8 @@ def benchmark(args):
     batch_size = 4
     x = torch.randint(0, 10000, (batch_size, args.context_length), device=device)
 
+
+
     if args.mixed_precision:
         print("Using Mixed Precision (BFloat16)")
         mp_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -83,6 +90,11 @@ def benchmark(args):
     else:
         model.train()
         torch.set_grad_enabled(True)
+
+    precision = "bf16" if args.mixed_precision else "fp32"
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
 
     def sync():
         if device == "cuda":
@@ -130,39 +142,48 @@ def benchmark(args):
             if args.mode in ["backward", "optimizer"]:
                 with nvtx.range("Backward Pass"):
                     loss.backward()
-
-            if args.mode == "optimizer":
+            elif args.mode == "optimizer":
                 with nvtx.range("Optimizer Step"):
                     optimizer.step()
-
         sync()
         end_time = timeit.default_timer()
         times.append(end_time - start_time)
     
+    peak_mem = None
     if args.profile_memory:
         peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 2)
         print(f"Peak Memory Usage: {peak_mem:.2f} MB")
-
-        snapshot_file = f"memory_snapshot_{args.model_size}_{args.context_length}_{args.mode}_{
-            'mp' if args.mixed_precision else 'fp32'}.pickle"
-        try:
-            torch.cuda.memory._dump_snapshot(snapshot_file)
-            print(f"Memory snapshot saved to {snapshot_file}")
-        except Exception as e:
-            print(f"Failed to dump snapshot: {e}")
-        
         torch.cuda.memory._record_memory_history(enabled=None)
 
-    print(f"Model: {args.model_size}, Context: {args.context_length}, Mode: {args.mode}, BF16: {args.mixed_precision}")
-    print(f"Average Time: {np.mean(times):.4f} s")
-    print(f"Std Dev: {np.std(times):.4f} s")
+    record = {
+        "timestamp": ts,
+        "model_size": args.model_size,
+        "context_length": int(args.context_length),
+        "mode": args.mode,
+        "batch_size": int(batch_size),
+        "precision": precision,
+        "compile": bool(args.compile),
+        "warmup_steps": int(args.warmup_steps),
+        "n_steps": int(args.n_steps),
+
+        "avg_s": round(float(np.mean(times)), 4),
+        "std_s": round(float(np.std(times)), 4),
+        "peak_mem_mb": round(peak_mem, 0),
+    }
+
+    jsonl_path = "results/bench_transformer_lm_nvtx.jsonl"
+    with open(jsonl_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(f"[Saved] JSONL appended: {jsonl_path}")
 
     if hasattr(cs336_basics.model, 'scaled_dot_product_attention'):
         cs336_basics.model.scaled_dot_product_attention = original_attn
 
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_size", type=str, choices=MODEL_CONFIGS.keys(), default="small", help="Model size from Table 1")
+    parser.add_argument("--model_size", type=str, choices=MODEL_CONFIGS.keys(), help="Model size from Table 1")
     parser.add_argument("--context_length", type=int, default=128, help="Context length")
     parser.add_argument("--warmup_steps", type=int, default=5, help="Number of warm-up steps")
     parser.add_argument("--n_steps", type=int, default=10, help="Number of measurement steps")
@@ -173,4 +194,5 @@ if __name__ == "__main__":
     parser.add_argument("--compile", action="store_true", help="")
 
     args = parser.parse_args()
+    os.makedirs("results", exist_ok=True)
     benchmark(args)

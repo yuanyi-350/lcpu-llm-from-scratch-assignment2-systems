@@ -1,0 +1,4 @@
+{"timestamp": "20260217_225817", "model_size": "xl", "context_length": 128, "mode": "forward", "batch_size": 4, "precision": "fp32", "compile": true, "warmup_steps": 5, "n_steps": 10, "avg_s": 0.0506, "std_s": 0.0002, "peak_mem_mb": 7867.0}
+{"timestamp": "20260217_225847", "model_size": "xl", "context_length": 128, "mode": "forward", "batch_size": 4, "precision": "fp32", "compile": false, "warmup_steps": 5, "n_steps": 10, "avg_s": 0.0612, "std_s": 0.0019, "peak_mem_mb": 7883.0}
+{"timestamp": "20260217_225924", "model_size": "xl", "context_length": 128, "mode": "forward", "batch_size": 4, "precision": "bf16", "compile": true, "warmup_steps": 5, "n_steps": 10, "avg_s": 0.0358, "std_s": 0.001, "peak_mem_mb": 7868.0}
+{"timestamp": "20260217_225948", "model_size": "xl", "context_length": 128, "mode": "forward", "batch_size": 4, "precision": "bf16", "compile": false, "warmup_steps": 5, "n_steps": 10, "avg_s": 0.0729, "std_s": 0.0095, "peak_mem_mb": 11709.0}

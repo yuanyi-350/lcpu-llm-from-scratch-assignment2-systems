@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from typing import Type
-from cs336_systems.flash_attention import *
+from cs336_systems.flash_attn2_pytorch import *
+from cs336_systems.flash_attn2_triton import *
 import torch
 
 
