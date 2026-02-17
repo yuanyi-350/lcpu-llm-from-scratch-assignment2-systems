@@ -2,8 +2,9 @@ import argparse
 import os
 os.environ.setdefault("TRITON_PRINT_AUTOTUNING", "1")
 import torch
-import triton
-from cs336_systems.flash_attn2_triton import FlashAttn2Triton as FlashAttentionTriton
+import triton.testing as ttesting
+
+from cs336_systems.flash_attn2_triton import TritonAttention as FlashAttentionTriton
 
 
 def _synchronize_if_cuda():
@@ -73,7 +74,7 @@ def main():
     )
 
     try:
-        results_ms = float(triton.testing.do_bench(flash_forward_backward, rep=args.rep, warmup=args.warmup))
+        results_ms = float(ttesting.do_bench(flash_forward_backward, rep=args.rep, warmup=args.warmup))
     except Exception:
         if args.debug_exceptions:
             import traceback
