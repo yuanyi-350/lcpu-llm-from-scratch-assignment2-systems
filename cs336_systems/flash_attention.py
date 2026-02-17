@@ -65,8 +65,77 @@ class FlashAttn2Pytorch(torch.autograd.Function):
         return O
 
     @staticmethod
-    def backward(ctx, grad_O):
-        raise NotImplementedError
+    def backward(ctx, dO):
+        """
+        Implements Algorithm 2 (tiled FlashAttention-2 backward) in pure PyTorch.
+
+        Inputs:
+          dO: gradient wrt output O, shape (B, Nq, D)
+
+        Saved (from forward):
+          Q: (B, Nq, D)
+          K: (B, Nk, D)
+          V: (B, Nk, D)
+          O: (B, Nq, D)
+          L: (B, Nq)  # row-wise logsumexp of S
+        """
+        # Unpack saved tensors
+        L, Q, K, V, O = ctx.saved_tensors
+        B, Nq, D = Q.shape
+        _, Nk, Dk = K.shape
+        assert D == Dk and dO.shape == O.shape
+
+        # Tile sizes (>=16). You can tune later.
+        Bq = 16
+        Bk = 16
+
+        scale = 1.0 / math.sqrt(D)
+
+        # Algorithm 2: D_vec = rowsum(dO ⊙ O)  (per query row)
+        # Shape: (B, Nq)
+        D_vec = torch.sum(dO.to(torch.float32) * O.to(torch.float32), dim=-1)
+
+        # Allocate grads
+        dQ = torch.zeros_like(Q, dtype=torch.float32)
+        dK = torch.zeros_like(K, dtype=torch.float32)
+        dV = torch.zeros_like(V, dtype=torch.float32)
+
+        # Split K,V into key tiles; outer loop over j (as in Algorithm 2)
+        for b in range(B):
+            for kj in range(0, Nk, Bk):
+                k = K[b, kj:kj+Bk, :].to(torch.float32)  # (Bk, D)
+                v = V[b, kj:kj+Bk, :].to(torch.float32)  # (Bk, D)
+
+                dK_j = torch.zeros_like(k)  # (Bk, D)
+                dV_j = torch.zeros_like(v)  # (Bk, D)
+
+                # Inner loop over query tiles i
+                for qi in range(0, Nq, Bq):
+                    q = Q[b, qi:qi+Bq, :].to(torch.float32)      # (Bq, D)
+                    do = dO[b, qi:qi+Bq, :].to(torch.float32)    # (Bq, D)
+                    l = L[b, qi:qi+Bq].to(torch.float32)         # (Bq,)
+                    d_row = D_vec[b, qi:qi+Bq].to(torch.float32) # (Bq,)
+
+                    S = einsum(q, k, "q d, k d -> q k") * scale  # (Bq, Bk)
+                    P = torch.exp(S - l[:, None])                # (Bq, Bk)
+
+                    dV_j += einsum(P, do, "q k, q d -> k d")     # (Bk, D)
+                    dP = einsum(do, v, "q d, k d -> q k")        # (Bq, Bk)
+                    dS = P * (dP - d_row[:, None])               # (Bq, Bk)
+
+                    dQ[b, qi:qi+Bq, :] += einsum(dS, k, "q k, k d -> q d") * scale # (Bq, D)
+                    dK_j += einsum(dS, q, "q k, q d -> k d") * scale               # (Bk, D)
+
+                dK[b, kj:kj+Bk, :] += dK_j
+                dV[b, kj:kj+Bk, :] += dV_j
+
+        # cast grads back to input dtype
+        dQ = dQ.to(Q.dtype)
+        dK = dK.to(K.dtype)
+        dV = dV.to(V.dtype)
+
+        # backward signature must match forward inputs: (Q, K, V, is_causal)
+        return dQ, dK, dV, None
 
 
 
@@ -181,6 +250,155 @@ def flash_fwd_kernel(
     tl.store(L_block_ptr, L)
 
 
+
+@triton.jit
+def compute_D_kernel(
+    dO_ptr, O_ptr, D_ptr,
+    stride_dob, stride_doq, stride_dod,
+    stride_ob,  stride_oq,  stride_od,
+    stride_db, stride_dq,
+    NQ, D: tl.constexpr,
+    Q_TILE: tl.constexpr,
+):
+    # grid = (Tq, B)
+    q_tile = tl.program_id(0)
+    b = tl.program_id(1)
+
+    # offsets for query rows in this tile
+    q_idx = q_tile * Q_TILE + tl.arange(0, Q_TILE)  # (Q_TILE,)
+    mask_q = q_idx < NQ
+
+    # build pointers for (Q_TILE, D)
+    d = tl.arange(0, D)  # assume D is power of 2 per spec; else you'd tile D too
+    # (Q_TILE, D) pointers
+    dO = tl.load(
+        dO_ptr + b * stride_dob + q_idx[:, None] * stride_doq + d[None, :] * stride_dod,
+        mask=mask_q[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    O = tl.load(
+        O_ptr + b * stride_ob + q_idx[:, None] * stride_oq + d[None, :] * stride_od,
+        mask=mask_q[:, None],
+        other=0.0,
+    ).to(tl.float32)
+
+    # rowsum over D
+    D_row = tl.sum(dO * O, axis=1)  # (Q_TILE,)
+
+    tl.store(
+        D_ptr + b * stride_db + q_idx * stride_dq,
+        D_row,
+        mask=mask_q
+    )
+
+
+
+@triton.jit
+def flash_bwd_kernel(
+    Q_ptr, K_ptr, V_ptr,
+    O_ptr, dO_ptr,
+    L_ptr, D_ptr,        # L = logsumexp, D = rowsum(dO ∘ O)
+    dQ_ptr, dK_ptr, dV_ptr,
+    stride_qb, stride_qq, stride_qd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_ob, stride_oq, stride_od,
+    stride_dob, stride_doq, stride_dod,
+    stride_lb, stride_lq,
+    stride_db, stride_dq,
+    stride_dqb, stride_dqq, stride_dqd,
+    stride_dkb, stride_dkk, stride_dkd,
+    stride_dvb, stride_dvk, stride_dvd,
+    NQ, NK,
+    scale,
+    D: tl.constexpr,
+    Q_TILE: tl.constexpr,
+    K_TILE: tl.constexpr,
+    is_causal: tl.constexpr,
+):
+    # grid = (Tq, Tk, B)
+    q_tile = tl.program_id(0)
+    k_tile = tl.program_id(1)
+    b = tl.program_id(2)
+
+    q_idx = q_tile * Q_TILE + tl.arange(0, Q_TILE)  # (Q_TILE,)
+    k_idx = k_tile * K_TILE + tl.arange(0, K_TILE)  # (K_TILE,)
+    mask_q = q_idx < NQ
+    mask_k = k_idx < NK
+
+    d = tl.arange(0, D)
+
+    # Load Q tile: (Q_TILE, D)
+    Q = tl.load(
+        Q_ptr + b * stride_qb + q_idx[:, None] * stride_qq + d[None, :] * stride_qd,
+        mask=mask_q[:, None],
+        other=0.0,
+    ).to(tl.float32)
+
+    # Load dO tile: (Q_TILE, D)
+    dO = tl.load(
+        dO_ptr + b * stride_dob + q_idx[:, None] * stride_doq + d[None, :] * stride_dod,
+        mask=mask_q[:, None],
+        other=0.0,
+    ).to(tl.float32)
+
+    # Load L and D vectors: (Q_TILE,)
+    L = tl.load(L_ptr + b * stride_lb + q_idx * stride_lq, mask=mask_q, other=-float("inf")).to(tl.float32)
+    Drow = tl.load(D_ptr + b * stride_db + q_idx * stride_dq, mask=mask_q, other=0.0).to(tl.float32)
+
+    # Load K, V tiles: (K_TILE, D)
+    K = tl.load(
+        K_ptr + b * stride_kb + k_idx[:, None] * stride_kk + d[None, :] * stride_kd,
+        mask=mask_k[:, None],
+        other=0.0,
+    ).to(tl.float32)
+
+    V = tl.load(
+        V_ptr + b * stride_vb + k_idx[:, None] * stride_vk + d[None, :] * stride_vd,
+        mask=mask_k[:, None],
+        other=0.0,
+    ).to(tl.float32)
+
+    S = tl.dot(Q, tl.trans(K)) * scale #  (Q_TILE, K_TILE)
+
+    if is_causal:
+        # mask out future keys: if k > q then add -1e6
+        causal = q_idx[:, None] < k_idx[None, :]
+        S = S + tl.where(causal, -1e6, 0.0).to(tl.float32)
+
+    P = tl.exp(S - L[:, None])  # (Q_TILE, K_TILE) fp32
+
+    dV_local = tl.dot(tl.trans(P), dO)  # (K_TILE, D) fp32
+    dP = tl.dot(dO, tl.trans(V))  # (Q_TILE, K_TILE) fp32
+    dS = P * (dP - Drow[:, None])
+
+    dQ_local = tl.dot(dS, K) * scale # (Q_TILE, D)
+    dK_local = tl.dot(tl.trans(dS), Q) * scale # (K_TILE, D)
+
+    # dQ: (Q_TILE, D)
+    tl.atomic_add(
+        dQ_ptr + b * stride_dqb + q_idx[:, None] * stride_dqq + d[None, :] * stride_dqd,
+        dQ_local,
+        mask=mask_q[:, None],
+    )
+
+    # dK: (K_TILE, D)
+    tl.atomic_add(
+        dK_ptr + b * stride_dkb + k_idx[:, None] * stride_dkk + d[None, :] * stride_dkd,
+        dK_local,
+        mask=mask_k[:, None],
+    )
+
+    # dV: (K_TILE, D)
+    tl.atomic_add(
+        dV_ptr + b * stride_dvb + k_idx[:, None] * stride_dvk + d[None, :] * stride_dvd,
+        dV_local,
+        mask=mask_k[:, None],
+    )
+
+
+
+
 class FlashAttn2Triton(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, is_causal: bool = False):
@@ -220,7 +438,64 @@ class FlashAttn2Triton(torch.autograd.Function):
         return O
 
     @staticmethod
-    def backward(ctx, grad_O):
-        raise NotImplementedError
+    def backward(ctx, dO):
+        # saved: Q,K,V,O,L  (L must be logsumexp per row)
+        L, Q, K, V, O = ctx.saved_tensors
+        is_causal = getattr(ctx, "is_causal", False)
 
+        B, NQ, D = Q.shape
+        _, NK, _ = K.shape
+        scale = 1.0 / math.sqrt(D)
 
+        # tile sizes (>=16); assume powers of 2 for tests
+        Q_TILE = 16
+        K_TILE = 16
+        assert NQ % Q_TILE == 0 and NK % K_TILE == 0 and D >= 16
+
+        # allocate Dvec (fp32)
+        Dvec = torch.empty((B, NQ), device=Q.device, dtype=torch.float32)
+
+        # grads in fp32 (atomic accumulation safer)
+        dQ = torch.zeros((B, NQ, D), device=Q.device, dtype=torch.float32)
+        dK = torch.zeros((B, NK, D), device=Q.device, dtype=torch.float32)
+        dV = torch.zeros((B, NK, D), device=Q.device, dtype=torch.float32)
+
+        # 1) compute D = rowsum(dO ∘ O)
+        grid_D = (NQ // Q_TILE, B)
+        compute_D_kernel[grid_D](
+            dO, O, Dvec,
+            dO.stride(0), dO.stride(1), dO.stride(2),
+            O.stride(0),  O.stride(1),  O.stride(2),
+            Dvec.stride(0), Dvec.stride(1),
+            NQ, D=D,
+            Q_TILE=Q_TILE,
+            num_warps=4,
+        )
+
+        # 2) backward tiles (Tq, Tk, B)
+        grid_bwd = (NQ // Q_TILE, NK // K_TILE, B)
+        flash_bwd_kernel[grid_bwd](
+            Q, K, V,
+            O, dO,
+            L, Dvec,
+            dQ, dK, dV,
+            Q.stride(0), Q.stride(1), Q.stride(2),
+            K.stride(0), K.stride(1), K.stride(2),
+            V.stride(0), V.stride(1), V.stride(2),
+            O.stride(0), O.stride(1), O.stride(2),
+            dO.stride(0), dO.stride(1), dO.stride(2),
+            L.stride(0), L.stride(1),
+            Dvec.stride(0), Dvec.stride(1),
+            dQ.stride(0), dQ.stride(1), dQ.stride(2),
+            dK.stride(0), dK.stride(1), dK.stride(2),
+            dV.stride(0), dV.stride(1), dV.stride(2),
+            NQ, NK,
+            scale,
+            D=D,
+            Q_TILE=Q_TILE,
+            K_TILE=K_TILE,
+            is_causal=is_causal,
+            num_warps=4,
+        )
+
+        return dQ.to(Q.dtype), dK.to(K.dtype), dV.to(V.dtype), None
