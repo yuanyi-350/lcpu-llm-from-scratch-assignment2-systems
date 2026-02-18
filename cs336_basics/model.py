@@ -484,12 +484,12 @@ class CausalMultiHeadSelfAttention(nn.Module):
         Returns:
             Self-attention outputs.
         """
-        *b, sequence_length, d_model = x.size()
+        *b, sequence_length, d_model = x.size() # x.shape: (*b, S, D)
         assert d_model == self.d_model
 
-        Q = self.q_proj(x)
-        K = self.k_proj(x)
-        V = self.v_proj(x)
+        Q = self.q_proj(x) # shape: (*b, S, H*d)
+        K = self.k_proj(x) # shape: (*b, S, H*d)
+        V = self.v_proj(x) # shape: (*b, S, H*d)
 
         # Take apart each head from the embedding dimension of Q, K, V to shape (..., num_heads, seq_len, d_k).
         Q, K, V = (
@@ -499,6 +499,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
 
         if token_positions is None:
             token_positions = einx.rearrange("seq -> b... seq", torch.arange(sequence_length, device=x.device), b=[1] * len(b))
+            # (1, 1, ..., 1, S), 其中 len(b) 个 1
 
         # Duplicate token positions for each head
         token_positions = rearrange(token_positions, "... seq -> ... 1 seq")

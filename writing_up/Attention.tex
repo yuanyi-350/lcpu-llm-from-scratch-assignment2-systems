@@ -16,6 +16,13 @@
 \algrenewcommand\algorithmicrequire{\textbf{Require:}}
 \algrenewcommand\algorithmicensure{\textbf{Ensure:}}
 
+\newcommand{\softmax}{\mathrm{softmax}}
+\newcommand{\dO}{\mathrm{d}O}
+\newcommand{\dP}{\mathrm{d}P}
+\newcommand{\dV}{\mathrm{d}V}
+\newcommand{\dS}{\mathrm{d}S}
+\newcommand{\dQ}{\mathrm{d}Q}
+\newcommand{\dK}{\mathrm{d}K}
 \newcommand{\vQ}{\mathbf{Q}}
 \newcommand{\vK}{\mathbf{K}}
 \newcommand{\vV}{\mathbf{V}}
@@ -24,6 +31,10 @@
 \newcommand{\vP}{\mathbf{P}}
 \newcommand{\diag}{\operatorname{diag}}
 \newcommand{\R}{\ensuremath{\mathbb{R}}}
+
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}} 
+
+\newcommand{\sorry}{{\color{red}{sorry}}} 
 
 \pagestyle{plain}
 
@@ -173,6 +184,7 @@ class TransFormerBlock(nn.Module):
 
 \end{itemize}
 
+\subsection{Forward}
 
 \begin{algorithm}[H]
 \caption{FlashAttention-2 forward pass}
@@ -225,5 +237,59 @@ $$
 $$
 
 这就推导出 11 行红色的公式
+
+\subsection{Backward}
+
+\begin{algorithm}[H]
+\caption{Tiled FlashAttention-2 backward pass}
+\label{alg:flashattn2_bwd}
+\begin{algorithmic}[1]
+\Require $Q,O,\mathrm{d}O \in \mathbb{R}^{N_q \times d}$, $K,V \in \mathbb{R}^{N_k \times d}$, $L \in \mathbb{R}^{N_q}$, tile sizes $B_q, B_k$
+\State Compute $D=\mathrm{rowsum}(\mathrm{d}O \circ O)\in\mathbb{R}^{N_q}$
+\State Split $Q,O,\mathrm{d}O$ into $T_q=\left\lceil\frac{N_q}{B_q}\right\rceil$ tiles
+  $Q_1,\ldots,Q_{T_q}$, $O_1,\ldots,O_{T_q}$, $\mathrm{d}O_1,\ldots,\mathrm{d}O_{T_q}$, each of size $B_q\times d$
+\State Split $K,V$ into $T_k=\left\lceil\frac{N_k}{B_k}\right\rceil$ tiles
+  $K^{(1)},\ldots,K^{(T_k)}$ and $V^{(1)},\ldots,V^{(T_k)}$, each of size $B_k\times d$
+\State Split $L,D$ into $T_q$ tiles $L_1,\ldots,L_{T_q}$ and $D_1,\ldots,D_{T_q}$, each of size $B_q$
+
+\For{$j = 1,\ldots,T_k$}
+  \State Load $K^{(j)}, V^{(j)}$ from global memory
+  \State Initialize $\mathrm{d}K^{(j)}=\mathrm{d}V^{(j)}=0\in\mathbb{R}^{B_k\times d}$
+  \For{$i = 1,\ldots,T_q$}
+    \State Load $Q_i, O_i, \mathrm{d}O_i, \mathrm{d}Q_i$ from global memory
+    \State Compute tile of attention scores
+      $S_i^{(j)}=\dfrac{Q_i (K^{(j)})^\top}{\sqrt{d}}\in\mathbb{R}^{B_q\times B_k}$
+    \State Compute attention probabilities
+      $P_i^{(j)}=\exp\!\big(S_i^{(j)}-L_i\big)\in\mathbb{R}^{B_q\times B_k}$
+    \State Compute $\mathrm{d}V^{(j)} \mathrel{+}= (P_i^{(j)})^\top \mathrm{d}O_i \in \mathbb{R}^{B_k\times d}$
+    \State Compute $\mathrm{d}P_i^{(j)}=\mathrm{d}O_i (V^{(j)})^\top \in \mathbb{R}^{B_q\times B_k}$
+    \State Compute $\mathrm{d}S_i^{(j)}= P_i^{(j)} \circ \big(\mathrm{d}P_i^{(j)}-D_i\big)/\sqrt{d}\in\mathbb{R}^{B_q\times B_k}$
+    \State Load $\mathrm{d}Q_i$ from global memory, then update
+      $\mathrm{d}Q_i \mathrel{+}= \mathrm{d}S_i^{(j)} K^{(j)}\in\mathbb{R}^{B_q\times d}$, and write back to global memory
+      \Comment{Must be atomic for correctness}
+    \State Compute $\mathrm{d}K^{(j)} \mathrel{+}= (\mathrm{d}S_i^{(j)})^\top Q_i \in \mathbb{R}^{B_k\times d}$
+  \EndFor
+  \State Write $\mathrm{d}K^{(j)}$ and $\mathrm{d}V^{(j)}$ to global memory as the $j$-th tiles of $\mathrm{d}K$ and $\mathrm{d}V$
+\EndFor
+
+\State \textbf{return} $\mathrm{d}Q, \mathrm{d}K, \mathrm{d}V$
+\end{algorithmic}
+\end{algorithm}
+
+
+首先在第一次作业的 \code{forward_pass.tex} 文件中我们已经推导出:
+
+Given $S=\frac{1}{\sqrt d}QK^\top$, $P=\softmax(S)$, $O=PV$, and upstream $\dO$:
+$$
+\begin{aligned}
+\dP &= \dO V^\top, \\
+\dV &= P^\top \dO, \\
+\dS &= P \odot \left(\dP - \mathrm{row\_sum}(\dP \odot P)\right), \\
+\dQ &= \frac{1}{\sqrt{d}} \dS K, \\
+\dK &= \frac{1}{\sqrt{d}} \dS^\top Q.
+\end{aligned}
+$$
+
+
 
 \end{document}
