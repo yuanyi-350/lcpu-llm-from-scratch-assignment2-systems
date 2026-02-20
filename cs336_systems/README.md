@@ -22,3 +22,5 @@ uv run /usr/local/cuda/bin/nsys profile \
   --force-overwrite=true \
   python -m cs336_systems.benchmark --model_size xl --context_length 128 --mode forward --n_steps 20
 ```
+
+5. 用 jsonl 存储结果, 避免结果覆盖.

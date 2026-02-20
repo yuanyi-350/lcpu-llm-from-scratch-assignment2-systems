@@ -1,3 +1,6 @@
+"""
+https://github.com/phanix5/TransformerSystems/blob/main/cs336_systems/flash_attn_triton.py
+"""
 import torch
 from torch import Tensor
 import triton
@@ -571,7 +574,7 @@ class TritonAttention(torch.autograd.Function):
         BATCH_SIZE, SEQ_LEN, HEAD_DIM = Q.shape
         BLOCK_SIZE_MACRO = 4096
 
-        preprocess_grid = (SEQ_LEN // BLOCK_SIZE_MACRO, BATCH_SIZE)
+        preprocess_grid = (triton.cdiv(SEQ_LEN, BLOCK_SIZE_MACRO), BATCH_SIZE)
         D = torch.empty_like(L)
         
         # Compute Di = dOi * O
@@ -586,11 +589,10 @@ class TritonAttention(torch.autograd.Function):
 
         # print(f"Debug Triton D: {D[1]}")
 
-        grid = (SEQ_LEN // BLOCK_SIZE_MACRO, 1, BATCH_SIZE)
-
         stage = 3 if ctx.causal else 1
 
-        _attn_bwd_dk_dv[grid](
+        grid_dk_dv = lambda meta: (triton.cdiv(SEQ_LEN, meta["BLOCK_KV"]), 1, BATCH_SIZE)
+        _attn_bwd_dk_dv[grid_dk_dv](
             Q, K, V,
             ctx.softmax_scale,
             dO, dQ, dK, dV,
@@ -600,7 +602,8 @@ class TritonAttention(torch.autograd.Function):
             STAGE=stage
         )
 
-        _attn_bwd_dq[grid](
+        grid_dq = lambda meta: (triton.cdiv(SEQ_LEN, meta["BLOCK_Q"]), 1, BATCH_SIZE)
+        _attn_bwd_dq[grid_dq](
             Q, K, V,
             ctx.softmax_scale,
             dO, dQ, dK, dV,

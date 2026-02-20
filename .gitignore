@@ -4,6 +4,7 @@ test_results.xml
 *.nsys-rep
 *.pdf
 *.aux
+logs/
 
 # 忽略所有 pickle 数据文件
 *.pickle

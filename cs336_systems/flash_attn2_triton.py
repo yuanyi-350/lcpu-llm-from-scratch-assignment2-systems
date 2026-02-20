@@ -5,8 +5,6 @@ import triton.language as tl
 
 
 
-
-
 @triton.jit
 def flash_fwd_kernel(
     Q_ptr, K_ptr, V_ptr,
@@ -30,7 +28,7 @@ def flash_fwd_kernel(
     
     if is_causal:
         causal_k_limit = tl.cdiv((q_tile + 1) * Q_TILE_SIZE, K_TILE_SIZE)
-        loop_end = min(num_k_tiles, causal_k_limit)
+        loop_end = tl.minimum(num_k_tiles, causal_k_limit)
     else:
         loop_end = num_k_tiles
 
@@ -77,7 +75,7 @@ def flash_fwd_kernel(
         order=(1, 0)
     )
 
-    q = tl.load(Q_block_ptr) 
+    q = tl.load(Q_block_ptr, boundary_check=(0,))
 
     m = tl.full((Q_TILE_SIZE,), -float("inf"), tl.float32)
     l = tl.zeros((Q_TILE_SIZE,), tl.float32)
@@ -87,18 +85,16 @@ def flash_fwd_kernel(
         q_idx = q_tile * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
 
     for kj in range(0, loop_end):
-        k = tl.load(K_block_ptr)
-        v = tl.load(V_block_ptr)
+        k = tl.load(K_block_ptr, boundary_check=(0,))
+        v = tl.load(V_block_ptr, boundary_check=(0,))
 
-        qk = tl.dot(q, tl.trans(k))
+        qk = tl.dot(q, tl.trans(k), out_dtype=tl.float32)
         s = qk * scale
 
-        # 2. Causal Masking (Selective)
         if is_causal:
-            if kj == loop_end - 1:
-                k_idx = kj * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
-                mask = q_idx[:, None] < k_idx[None, :]
-                s = tl.where(mask, -float("inf"), s)
+            k_idx = kj * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+            mask = q_idx[:, None] < k_idx[None, :]
+            s = tl.where(mask, -float("inf"), s)
         
         rowmax = tl.max(s, axis=1)
         m_new = tl.maximum(m, rowmax)
@@ -109,7 +105,7 @@ def flash_fwd_kernel(
         o = o * tl.exp(m - m_new)[:, None]
         
         # 计算当前的加权和: P @ V
-        # 关键点：将 P (fp32) 转回 V 的类型 (bf16) 再做 dot，可以利用 Tensor Cores 加速
+        # [KeyPoint] 将 P (fp32) 转回 V 的类型 (bf16) 再做 dot，可以利用 Tensor Cores 加速
         p_cast = p.to(v.type.element_ty)
         o = tl.dot(p_cast, v, acc=o)
 
@@ -121,8 +117,8 @@ def flash_fwd_kernel(
     L_out = m + tl.log(l)
 
     # 存储结果 (转回原来的 dtype, 例如 bf16)
-    tl.store(O_block_ptr, o.to(O_block_ptr.type.element_ty))
-    tl.store(L_block_ptr, L_out)
+    tl.store(O_block_ptr, o.to(O_block_ptr.type.element_ty), boundary_check=(0,))
+    tl.store(L_block_ptr, L_out, boundary_check=(0,))
 
 
 
@@ -150,12 +146,12 @@ def compute_D_kernel(
         dO_ptr + b * stride_dob + q_idx[:, None] * stride_doq + d[None, :] * stride_dod,
         mask=mask_q[:, None],
         other=0.0,
-    ).to(tl.float32)
+    )
     O = tl.load(
         O_ptr + b * stride_ob + q_idx[:, None] * stride_oq + d[None, :] * stride_od,
         mask=mask_q[:, None],
         other=0.0,
-    ).to(tl.float32)
+    )
 
     # rowsum over D
     D_row = tl.sum(dO * O, axis=1)  # (Q_TILE,)
@@ -192,11 +188,10 @@ def flash_bwd_dq_kernel(
     q_tile = tl.program_id(0)
     b = tl.program_id(1)
 
-    q_idx = q_tile * Q_TILE + tl.arange(0, Q_TILE)          # (Q_TILE,)
-    d = tl.arange(0, D)                                     # (D,)
+    q_idx = q_tile * Q_TILE + tl.arange(0, Q_TILE)
     mask_q = q_idx < NQ
+    d = tl.arange(0, D)
 
-    # Load Q tile and dO tile (keep bf16 to use tensor core, cast later as needed)
     Q = tl.load(
         Q_ptr + b * stride_qb + q_idx[:, None] * stride_qq + d[None, :] * stride_qd,
         mask=mask_q[:, None],
@@ -208,63 +203,77 @@ def flash_bwd_dq_kernel(
         other=0.0,
     )
 
-    # L and Drow are fp32 buffers (or will be cast to fp32)
     L = tl.load(L_ptr + b * stride_lb + q_idx * stride_lq, mask=mask_q, other=-float("inf")).to(tl.float32)
     Drow = tl.load(Drow_ptr + b * stride_db + q_idx * stride_dqrow, mask=mask_q, other=0.0).to(tl.float32)
 
-    # dQ accumulator in fp32
     dQ_acc = tl.zeros((Q_TILE, D), tl.float32)
 
-    # Bring scale into triton world (scale might be python float)
-    # scale_t = tl.full((), scale, tl.float32)
-
-    # loop over k tiles
+    # [KeyPoint] Causal 模式下，动态计算 K 循环的终点
     num_k_tiles = tl.cdiv(NK, K_TILE)
-    for kt in range(0, num_k_tiles):
-        k_idx = kt * K_TILE + tl.arange(0, K_TILE)          # (K_TILE,)
-        mask_k = k_idx < NK
+    if is_causal:
+        # Q 只看它之前的 K。当前 Q 块最大的索引是 (q_tile + 1) * Q_TILE - 1
+        # 算出对应的 k_tile 极限在哪里
+        loop_end = tl.cdiv((q_tile + 1) * Q_TILE, K_TILE)
+        loop_end = tl.minimum(loop_end, num_k_tiles)
+    else:
+        loop_end = num_k_tiles
 
-        K = tl.load(
-            K_ptr + b * stride_kb + k_idx[:, None] * stride_kk + d[None, :] * stride_kd,
-            mask=mask_k[:, None],
-            other=0.0,
-        )
-        V = tl.load(
-            V_ptr + b * stride_vb + k_idx[:, None] * stride_vk + d[None, :] * stride_vd,
-            mask=mask_k[:, None],
-            other=0.0,
-        )
+    K_block_ptr = tl.make_block_ptr(
+        base=K_ptr + b * stride_kb,
+        shape=(NK, D),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),
+        block_shape=(K_TILE, D),
+        order=(1, 0)
+    )
+    V_block_ptr = tl.make_block_ptr(
+        base=V_ptr + b * stride_vb,
+        shape=(NK, D),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(K_TILE, D),
+        order=(1, 0)
+    )
 
-        # S = Q K^T * scale  (compute logits in fp32 for softmax stability)
-        # dot requires same dtype operands: Q and K are both bf16 here.
-        S = tl.dot(Q, tl.trans(K)) * scale
+    for kt in range(0, loop_end):
+        K = tl.load(K_block_ptr, boundary_check=(0,))
+        V = tl.load(V_block_ptr, boundary_check=(0,))
+
+        S = tl.dot(Q, tl.trans(K), out_dtype=tl.float32) * scale
+        P = tl.exp(S - L[:, None])
 
         if is_causal:
-            causal = q_idx[:, None] < k_idx[None, :]         # future => mask out
-            S = S + tl.where(causal, -1e6, 0.0).to(tl.float32)
+            k_idx = kt * K_TILE + tl.arange(0, K_TILE)
+            causal_mask = q_idx[:, None] >= k_idx[None, :] # True 代表可见
+            P = tl.where(causal_mask, P, 0.0)
 
-        # P = exp(S - L)
-        P = tl.exp(S - L[:, None])                           # fp32 (Q_TILE, K_TILE)
+        dP = tl.dot(dO, tl.trans(V), out_dtype=tl.float32)
+        dS = P * (dP - Drow[:, None])
 
-        # dP = dO V^T  (want fp32)
-        dP = tl.dot(dO, tl.trans(V)).to(tl.float32)          # fp32 (Q_TILE, K_TILE)
+        dQ_acc += tl.dot(dS.to(K.dtype), K, out_dtype=tl.float32) * scale
 
-        # dS = P * (dP - Drow)
-        dS = P * (dP - Drow[:, None])                        # fp32 (Q_TILE, K_TILE)
+        K_block_ptr = tl.advance(K_block_ptr, (K_TILE, 0))
+        V_block_ptr = tl.advance(V_block_ptr, (K_TILE, 0))
 
-        # dQ += dS K * scale
-        dS_cast = dS.to(K.dtype)
-        dQ_acc += tl.dot(dS_cast, K).to(tl.float32) * scale
-
-
-    # store dQ (unique writer: no atomic)
     tl.store(
         dQ_ptr + b * stride_dqb + q_idx[:, None] * stride_dqq + d[None, :] * stride_dqd,
-        dQ_acc,
+        dQ_acc.to(Q.dtype),
         mask=mask_q[:, None],
     )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"Q_TILE": Q_TILE, "K_TILE": K_TILE},
+            # num_warps=4,  # ✅ 正确写法：在这里显式指定
+            # num_stages=3  # ✅ 正确写法：在这里显式指定
+        )
+        for Q_TILE in [32, 64]
+        for K_TILE in [64, 128]
+    ],
+    key=["NQ", "NK", "D", "is_causal"],
+)
 @triton.jit
 def flash_bwd_dkv_kernel(
     Q_ptr, K_ptr, V_ptr,
@@ -306,11 +315,22 @@ def flash_bwd_dkv_kernel(
         other=0.0,
     )
 
+    dK_acc = tl.zeros((K_TILE, D), tl.float32)
+    dV_acc = tl.zeros((K_TILE, D), tl.float32)
+
+    # loop over q tiles
+    num_q_tiles = tl.cdiv(NQ, Q_TILE)
+
+    start_q_tile = (k_tile * K_TILE) // Q_TILE if is_causal else 0
+
+    start_q_tile = (k_tile * K_TILE) // Q_TILE if is_causal else 0
+    start_q_offset = start_q_tile * Q_TILE
+    
     Q_block_ptr = tl.make_block_ptr(
         base=Q_ptr + b * stride_qb,
         shape=(NQ, D),
         strides=(stride_qq, stride_qd),
-        offsets=(0, 0),
+        offsets=(start_q_offset, 0),  # <--- 必须从这里开始！
         block_shape=(Q_TILE, D),
         order=(1, 0)
     )
@@ -318,38 +338,33 @@ def flash_bwd_dkv_kernel(
         base=dO_ptr + b * stride_dob,
         shape=(NQ, D),
         strides=(stride_doq, stride_dod),
-        offsets=(0, 0),
+        offsets=(start_q_offset, 0),  # <--- 必须从这里开始！
         block_shape=(Q_TILE, D),
         order=(1, 0),
     )
 
-    dK_acc = tl.zeros((K_TILE, D), tl.float32)
-    dV_acc = tl.zeros((K_TILE, D), tl.float32)
-
-    # loop over q tiles
-    num_q_tiles = tl.cdiv(NQ, Q_TILE)
-    for qt in range(0, num_q_tiles):
+    # [keyPoint]
+    for qt in range(start_q_tile, num_q_tiles):
         q_idx = qt * Q_TILE + tl.arange(0, Q_TILE)
         mask_q = q_idx < NQ
 
-        Q = tl.load(Q_block_ptr)
-        dO = tl.load(dO_block_ptr)
+        Q = tl.load(Q_block_ptr, boundary_check=(0,))
+        dO = tl.load(dO_block_ptr, boundary_check=(0,))
 
-        L = tl.load(L_ptr + b * stride_lb + q_idx * stride_lq, mask=mask_q, other=-float("inf")).to(tl.float32)
-        Drow = tl.load(Drow_ptr + b * stride_db + q_idx * stride_dqrow, mask=mask_q, other=0.0).to(tl.float32)
+        L = tl.load(L_ptr + b * stride_lb + q_idx * stride_lq, mask=mask_q, other=-float("inf"))
+        Drow = tl.load(Drow_ptr + b * stride_db + q_idx * stride_dqrow, mask=mask_q, other=0.0)
 
         S = tl.dot(Q, tl.trans(K), out_dtype=tl.float32) * scale
 
+        P = tl.exp(S - L[:, None])
         if is_causal:
-            causal = q_idx[:, None] < k_idx[None, :]
-            S = S + tl.where(causal, -1e6, 0.0).to(tl.float32)
-
-        P = tl.exp(S - L[:, None])                           # fp32 (Q_TILE, K_TILE)
+            causal_mask = q_idx[:, None] >= k_idx[None, :]
+            P = tl.where(causal_mask, P, 0.0)
 
         # dV += P^T dO
-        # Cast P to V dtype for faster matmul, but accumulate fp32
+        # [KeyPoint]: Cast P to V dtype for faster matmul, but accumulate fp32
         P_cast = P.to(V.dtype)
-        dV_acc += tl.dot(tl.trans(P_cast), dO).to(tl.float32)
+        dV_acc += tl.dot(tl.trans(P_cast), dO, out_dtype=tl.float32)
 
         # dP = dO V^T
         dP = tl.dot(dO, tl.trans(V), out_dtype=tl.float32)   # fp32
@@ -357,19 +372,19 @@ def flash_bwd_dkv_kernel(
 
         # dK += dS^T Q * scale
         dS_cast = dS.to(Q.dtype)
-        dK_acc += tl.dot(tl.trans(dS_cast), Q) * scale
+        dK_acc += tl.dot(tl.trans(dS_cast), Q, out_dtype=tl.float32) * scale
         Q_block_ptr = tl.advance(Q_block_ptr, (Q_TILE, 0))
         dO_block_ptr = tl.advance(dO_block_ptr, (Q_TILE, 0))
 
     # store dK/dV (unique writer: no atomic)
     tl.store(
         dK_ptr + b * stride_dkb + k_idx[:, None] * stride_dkk + d[None, :] * stride_dkd,
-        dK_acc,
+        dK_acc.to(K.dtype),
         mask=mask_k[:, None],
     )
     tl.store(
         dV_ptr + b * stride_dvb + k_idx[:, None] * stride_dvk + d[None, :] * stride_dvd,
-        dV_acc,
+        dV_acc.to(V.dtype),
         mask=mask_k[:, None],
     )
 
@@ -382,15 +397,15 @@ class FlashAttn2Triton(torch.autograd.Function):
         _, Nk, Dk = K.shape
         assert D == Dk and V.shape[:2] == (B, Nk)
 
-        # tile sizes (>=16)
-        Q_TILE = 16
-        K_TILE = 16
+        # [KeyPoint]
+        Q_TILE = 64
+        K_TILE = 64
         scale = 1.0 / math.sqrt(D)
 
         O = torch.empty((B, Nq, D), device=Q.device, dtype=Q.dtype)
         L = torch.empty((B, Nq), device=Q.device, dtype=torch.float32)
 
-        grid = (Nq // Q_TILE, B)  # dimensions are clean powers of 2 and >=16 per spec
+        grid = (triton.cdiv(Nq, Q_TILE), B)
 
         flash_fwd_kernel[grid](
             Q, K, V,
@@ -416,7 +431,6 @@ class FlashAttn2Triton(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dO):
-        # saved: L, Q, K, V, O
         L, Q, K, V, O = ctx.saved_tensors
         is_causal = getattr(ctx, "is_causal", False)
 
@@ -437,12 +451,7 @@ class FlashAttn2Triton(torch.autograd.Function):
         dK = torch.empty((B, NK, D), device=Q.device, dtype=torch.float32)
         dV = torch.empty((B, NK, D), device=Q.device, dtype=torch.float32)
 
-        # (optional but safe) initialize if your kernels fully overwrite outputs
-        # dQ.zero_(); dK.zero_(); dV.zero_()
-        # 这里拆分后是 unique-writer + tl.store，理论上不需要 zero_
-
-        # 1) compute D = rowsum(dO ∘ O)
-        grid_D = (NQ // Q_TILE, B)
+        grid_D = (triton.cdiv(NQ, Q_TILE), B)
         compute_D_kernel[grid_D](
             dO, O, Dvec,
             dO.stride(0), dO.stride(1), dO.stride(2),
@@ -455,30 +464,24 @@ class FlashAttn2Triton(torch.autograd.Function):
         )
 
         # 2a) dQ kernel: grid = (Tq, B)
-        grid_dq = (NQ // Q_TILE, B)
+        grid_dq = (triton.cdiv(NQ, Q_TILE), B)
         flash_bwd_dq_kernel[grid_dq](
             Q, K, V,
             dO,
             L, Dvec,
             dQ,
-            # Q strides
             Q.stride(0), Q.stride(1), Q.stride(2),
-            # K strides
             K.stride(0), K.stride(1), K.stride(2),
-            # V strides
             V.stride(0), V.stride(1), V.stride(2),
-            # dO strides
             dO.stride(0), dO.stride(1), dO.stride(2),
-            # L strides
             L.stride(0), L.stride(1),
-            # Dvec strides
+
             Dvec.stride(0), Dvec.stride(1),
-            # dQ strides
             dQ.stride(0), dQ.stride(1), dQ.stride(2),
-            # runtime args
+
             NQ=NQ, NK=NK,
             scale=scale,
-            # constexpr args
+
             D=D,
             Q_TILE=Q_TILE,
             K_TILE=K_TILE,
@@ -488,7 +491,7 @@ class FlashAttn2Triton(torch.autograd.Function):
         )
 
         # 2b) dK/dV kernel: grid = (Tk, B)
-        grid_dkv = (NK // K_TILE, B)
+        grid_dkv = lambda META: (triton.cdiv(NK, META["K_TILE"]), B)
         flash_bwd_dkv_kernel[grid_dkv](
             Q, K, V,
             dO,
@@ -505,11 +508,11 @@ class FlashAttn2Triton(torch.autograd.Function):
             NQ=NQ, NK=NK,
             scale=scale,
             D=D,
-            Q_TILE=Q_TILE,
-            K_TILE=K_TILE,
+            # Q_TILE=Q_TILE,
+            # K_TILE=K_TILE,
             is_causal=is_causal,
-            num_warps=4,
-            num_stages=3,
+            # num_warps=4,
+            # num_stages=3,
         )
 
         # cast back to input dtype to match autograd expectations
