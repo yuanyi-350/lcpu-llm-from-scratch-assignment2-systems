@@ -4,7 +4,7 @@ os.environ.setdefault("TRITON_PRINT_AUTOTUNING", "1")
 import torch
 import triton.testing as ttesting
 
-from cs336_systems.flash_attn2_triton import FlashAttn2Triton as FlashAttentionTriton # 66ms
+from cs336_systems.flash_attn2_triton import FlashAttn2Triton as FlashAttentionTriton # 25ms
 from cs336_systems.flash_attn2_triton_leaderboard import TritonAttention # < 4ms on 5090
 
 def _synchronize_if_cuda():
