@@ -33,6 +33,8 @@ def get_flashattention_autograd_function_triton() -> Type:
         A class object (not an instance of the class)
     """
     # For example: return MyTritonFlashAttentionAutogradFunctionClass
+    # from cs336_systems.flash_attn2_triton_leaderboard import TritonAttention
+    # return TritonAttention
     return FlashAttn2Triton
 
 
