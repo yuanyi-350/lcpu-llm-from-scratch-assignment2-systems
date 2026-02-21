@@ -178,7 +178,7 @@ def flash_bwd_dq_kernel(
     stride_db, stride_dqrow,
     stride_dqb, stride_dqq, stride_dqd,
     NQ: tl.constexpr, NK: tl.constexpr,
-    scale,                           # fp32 scalar (maybe python float)
+    scale,
     D: tl.constexpr,
     Q_TILE: tl.constexpr,
     K_TILE: tl.constexpr,
@@ -209,14 +209,9 @@ def flash_bwd_dq_kernel(
     dQ_acc = tl.zeros((Q_TILE, D), tl.float32)
 
     # [KeyPoint] Causal 模式下，动态计算 K 循环的终点
-    num_k_tiles = tl.cdiv(NK, K_TILE)
+    loop_end = tl.cdiv(NK, K_TILE)
     if is_causal:
-        # Q 只看它之前的 K。当前 Q 块最大的索引是 (q_tile + 1) * Q_TILE - 1
-        # 算出对应的 k_tile 极限在哪里
-        loop_end = tl.cdiv((q_tile + 1) * Q_TILE, K_TILE)
-        loop_end = tl.minimum(loop_end, num_k_tiles)
-    else:
-        loop_end = num_k_tiles
+        loop_end = tl.minimum(loop_end, tl.cdiv((q_tile + 1) * Q_TILE, K_TILE))
 
     K_block_ptr = tl.make_block_ptr(
         base=K_ptr + b * stride_kb,
@@ -421,12 +416,11 @@ class FlashAttn2Triton(torch.autograd.Function):
             Q_TILE_SIZE=Q_TILE,
             K_TILE_SIZE=K_TILE,
             is_causal=is_causal,
-            num_warps=4,  # ok default; can tune later
+            num_warps=4,
         )
 
         ctx.save_for_backward(L, Q, K, V, O)
         ctx.is_causal = is_causal
-        ctx.scale = scale
         return O
 
     @staticmethod
@@ -436,14 +430,13 @@ class FlashAttn2Triton(torch.autograd.Function):
 
         B, NQ, D = Q.shape
         _, NK, _ = K.shape
-        scale = ctx.scale
+        scale = 1.0 / math.sqrt(D)
 
-        # tiles
+        # [KeyPoint]
         Q_TILE = 64
         K_TILE = 64
         assert NQ % Q_TILE == 0 and NK % K_TILE == 0 and D >= 16
 
-        # Dvec = rowsum(dO * O), fp32
         Dvec = torch.empty((B, NQ), device=Q.device, dtype=torch.float32)
 
         # grads in fp32 (then cast back to input dtype at return)
@@ -463,7 +456,6 @@ class FlashAttn2Triton(torch.autograd.Function):
             num_warps=4,
         )
 
-        # 2a) dQ kernel: grid = (Tq, B)
         grid_dq = (triton.cdiv(NQ, Q_TILE), B)
         flash_bwd_dq_kernel[grid_dq](
             Q, K, V,
