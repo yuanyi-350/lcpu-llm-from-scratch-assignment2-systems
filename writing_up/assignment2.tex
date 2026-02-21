@@ -22,7 +22,7 @@
     breaklines=true,
     captionpos=b,
     keywordstyle=\color{blue},
-    commentstyle=\color{green},
+    commentstyle=\color{gray},
     stringstyle=\color{red},
     showstringspaces=false
 }
@@ -236,10 +236,59 @@ FlashAttention-2 Forward Pass (15 points)
 
 \begin{problem}[\code{flash_backward}]
 FlashAttention-2 Backward Pass (5 points)
-\begin{questions}
-    \item Implement the backward pass for FlashAttention-2 using \code{torch.compile} and the recomputation strategy (Equations 13-19).
-\end{questions}
+Implement the backward pass for FlashAttention-2 using \code{torch.compile} and the recomputation strategy (Equations 13-19).
 \end{problem}
+\begin{solution*}
+    \paragraph{Experience} When to use \code{fp32} and when to use \code{bf16} / \code{fp16}?
+
+    \subparagraph{\code{bf16} / \code{fp16} is better:}
+
+    \begin{itemize}
+        \item 全局内存的读写 (Global Memory I/O)
+
+        对象： \code{Q, K, V, dO} 的 \code{tl.load}, 以及最终 \code{dK, dV} 的 \code{tl.store}, 突破 Memory-wall (显存带宽瓶颈). 使用 16-bit 数据可以将显存读写量直接减半. 
+
+        \item 矩阵乘法的输入 (Tensor Core Inputs)
+
+        对象： 传入 \code{tl.dot(a, b)} 的 a 和 b, 现代 GPU 的 Tensor Core 规定, 提高运算速度.
+
+        Example:
+
+        \begin{lstlisting}[language=Python]
+# type of P_cast, dO are bf16 / fp16
+# Incorrect: Triggers double casting and precision truncation
+dV_acc += tl.dot(tl.trans(P_cast), dO).to(tl.float32) 
+# Correct: Hardware directly outputs in 32-bit
+dV_acc += tl.dot(tl.trans(P_cast), dO, out_dtype=tl.float32)       
+        \end{lstlisting}
+    \end{itemize}
+
+    \subparagraph{Must use \code{fp32}:}
+
+    \begin{itemize}
+        \item 所有的累加器 (Accumulators)
+        
+        对象： 反向传播中的 \code{dK_acc}, \code{dV_acc}, 以及前向传播中的输出 \code{O_acc}, 容易导致截断误差.
+
+        \item 指数、对数与除法运算 (Non-linear Math)
+        
+        对象： Softmax 核心计算, 如 \code{P=exp(S−L)}.  指数运算 $\exp$ 极其敏感, 输入端的微小精度丢失会被指数级放大. 
+
+        \item 逐元素 (Element-wise)中间计算
+
+        对象： 例如计算 \code{dS=P*(dP−D)}
+    
+    \end{itemize}
+
+
+
+        
+
+    
+
+
+\end{solution*}
+
 
 \section{Distributed Data Parallel Training}
 
@@ -282,55 +331,6 @@ Sharding Analysis (5 points)
 \end{questions}
 \end{problem}
 
-\begin{lstlisting}
-stu2400010766@lfs-dev:~/cs336-2$ uv run python -m cs336_systems.benchmark --model_size xl --context_length 128 --mode forward --n_steps 
-100
-Running on cuda
-Monkey patching scaled_dot_product_attention with NVTX annotated version...
-Compiling model...
-Using Full Precision (FP32)
-Warming up for 5 steps...
-/home/stu2400010766/cs336-2/.venv/lib/python3.13/site-packages/torch/_dynamo/variables/functions.py:1692: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS="+dynamo" for a DEBUG stack trace.
-  torch._dynamo.utils.warn_once(msg)
-W0213 22:19:50.750000 1056616 .venv/lib/python3.13/site-packages/torch/fx/experimental/symbolic_shapes.py:6833] [8/1] _maybe_guard_rel() was called on non-relation expression Eq(s16, 1) | Eq(s16, 128)
-Measuring for 100 steps...
-Model: xl, Context: 128, Mode: forward, BF16: False
-Average Time: 0.0507 s
-Std Dev: 0.0001 s
 
-stu2400010766@lfs-dev:~/cs336-2$ uv run python -m cs336_systems.benchmark --model_size xl --context_length 128 --mode forward --n_steps 100
-Running on cuda
-Monkey patching scaled_dot_product_attention with NVTX annotated version...
-Using Full Precision (FP32)
-Warming up for 5 steps...
-Measuring for 100 steps...
-Model: xl, Context: 128, Mode: forward, BF16: False
-Average Time: 0.0587 s
-Std Dev: 0.0075 s
-
-stu2400010766@lfs-dev:~/cs336-2$ uv run python -m cs336_systems.benchmark --model_size xl --context_length 128 --mode forward --n_steps 100 --mixed_precision
-Running on cuda
-Monkey patching scaled_dot_product_attention with NVTX annotated version...
-Using Mixed Precision (BFloat16)
-Warming up for 5 steps...
-Measuring for 100 steps...
-Model: xl, Context: 128, Mode: forward, BF16: True
-Average Time: 0.0537 s
-Std Dev: 0.0126 s
-
-stu2400010766@lfs-dev:~/cs336-2$ uv run python -m cs336_systems.benchmark --model_size xl --context_length 128 --mode forward --n_steps 100 --mixed_precision --compile
-Running on cuda
-Monkey patching scaled_dot_product_attention with NVTX annotated version...
-Compiling model...
-Using Mixed Precision (BFloat16)
-Warming up for 5 steps...
-/home/stu2400010766/cs336-2/.venv/lib/python3.13/site-packages/torch/_dynamo/variables/functions.py:1692: UserWarning: Dynamo detected a call to a `functools.lru_cache`-wrapped function. Dynamo ignores the cache wrapper and directly traces the wrapped function. Silent incorrectness is only a *potential* risk, not something we have observed. Enable TORCH_LOGS="+dynamo" for a DEBUG stack trace.
-  torch._dynamo.utils.warn_once(msg)
-W0213 22:23:47.686000 1062952 .venv/lib/python3.13/site-packages/torch/fx/experimental/symbolic_shapes.py:6833] [8/1] _maybe_guard_rel() was called on non-relation expression Eq(s16, 1) | Eq(s16, 128)
-Measuring for 100 steps...
-Model: xl, Context: 128, Mode: forward, BF16: True
-Average Time: 0.0264 s
-Std Dev: 0.0005 s
-\end{lstlisting}
 
 \end{document}
